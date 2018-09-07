@@ -1,5 +1,4 @@
 #!/usr/bin/python
-# -*- coding: utf-8 -*-
 
 #------------------------------------------------------------------------------
 # SourceQuery - Python class for querying info from Source Dedicated Servers
@@ -30,53 +29,22 @@
 # TODO: according to spec, packets may be bzip2 compressed.
 #       not implemented yet because I couldn't find a server that does this.
 
+
+import logging
 import socket
 import time
 
-from packet import PacketBuffer
+from buffer import SteamPacketBuffer
 from server import Server
+from packet import *
 
 PACKET_SIZE = 1400
-PACKET_HEAD = -1
-PACKET_SPLIT = -2
+SINGLE_PACKET_RESPONSE = -1
+MULTIPLE_PACKET_RESPONSE = -2
 
 
-class PacketType:
-    Info, Challenge, Players, Rules = range(4)
-
-
-class RequestType:
-    Info = 'TSource Engine Query'
-    Challenge = -1
-    Players = 0x55
-    Rules = 0x56
-
-
-class ResponseType:
-    Info = 0x49
-    Challenge = 0x41
-    Players = 0x44
-    Rules = 0x45
-
-
-class PacketFactory:
-    def create(packet_type):
-        packet = PacketBuffer()
-        packet.put_long(PACKET_HEAD)
-
-        if packet_type == PacketType.Info:
-            packet.put_string(RequestType.Info)
-        elif packet_type == PacketType.Challenge:
-            packet.put_byte(RequestType.Players)
-            packet.put_long(RequestType.Challenge)
-        elif packet_type == PacketType.Players:
-            packet.put_byte(RequestType.Players)
-        elif packet_type == PacketType.Rules:
-            packet.put_byte(RequestType.Rules)
-        else:
-            return None
-
-        return packet
+class SourceQueryError(Exception):
+    pass
 
 
 class SourceQuery:
@@ -92,140 +60,111 @@ class SourceQuery:
     """
 
     def __init__(self, host, port=27015, timeout=1):
+        self.logger = logging.getLogger('SourceQuery')
         self.server = Server(socket.gethostbyname(host), port)
         self._timeout = timeout
-        self._challenge = RequestType.Challenge
         self._connect()
 
     def __del__(self):
         self._connection.close()
 
     def _connect(self):
+        self.logger.info('Connecting to %s', self.server)
         self._connection = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._connection.settimeout(self._timeout)
         self._connection.connect(self.server.as_tuple())
 
-    def _query(self, packet, challenge=False):
-        if challenge:
-            packet.put_long(self._get_challenge())
-
-        self._connection.send(packet.getvalue())
-        return self._receive()
-
     def _receive(self, packet_buffer={}):
-        packet = PacketBuffer(self._connection.recv(PACKET_SIZE))
-        packet_type = packet.get_long()
+        response = self._connection.recv(PACKET_SIZE)
+        self.logger.debug('Recieved: %s', response)
+        packet = SteamPacketBuffer(response)
+        response_type = packet.read_long()
 
-        if packet_type == PACKET_HEAD:
+        if response_type == SINGLE_PACKET_RESPONSE:
+            self.logger.debug('Single packet response')
             return packet
 
-        elif packet_type == PACKET_SPLIT:
-            request_id = packet.get_long()  # TODO: compressed?
+        elif response_type == MULTIPLE_PACKET_RESPONSE:
+            self.logger.debugg('Multiple packet response')
+            request_id = packet.read_long()  # TODO: compressed?
 
             if request_id not in packet_buffer:
                 packet_buffer.setdefault(request_id, [])
 
-            total_packets = packet.get_byte()
-            current_packet_number = packet.get_byte()
-            paket_size = packet.get_short()
+            total_packets = packet.read_byte()
+            current_packet_number = packet.read_byte()
+            paket_size = packet.read_short()
             packet_buffer[request_id].insert(current_packet_number, packet.read())
 
             if current_packet_number == total_packets - 1:
                 full_packet = PacketBuffer(b''.join(packet_buffer[request_id]))
 
-                if full_packet.get_long() == PACKET_HEAD:
+                if full_packet.read_long() == PACKET_HEAD:
                     return full_packet
             else:
                 return self._receive(packet_buffer)
+        else:
+            self.logger.error('Received invalid response type: %s', response_type)
+            raise SourceQueryError('Received invalid response type')
 
     def _get_challenge(self):
-        if self._challenge != RequestType.Challenge:
-            return self._challenge
+        response = self._send(ChallengeRequest())
 
-        packet = self._query(PacketFactory.create(PacketType.Challenge))
+        response.is_valid()
+        return response.raw
 
-        if packet.get_byte() == ResponseType.Challenge:
-            self._challenge = packet.get_long()
-            return self._challenge
+    def _send(self, Paket):
+        if isinstance(Paket, Challengeable):
+            challenge = self._get_challenge()
+            self.logger.debug('Using challenge: %s', challenge)
+            Paket.challenge = challenge
+
+        timer_start = time.time()
+        self.logger.debug('Paket: %s', Paket.as_bytes())
+        self._connection.send(Paket.as_bytes())
+        result = self._receive()
+        ping = round((time.time() - timer_start) * 1000, 2)
+        response = create_response(Paket.class_name(), result, ping)
+
+        if not response.is_valid():
+            raise SourceQueryError('Response paket is invalid.')
+
+        return response
+
+    def request(request):
+        def wrapper(self):
+            response = request(self)
+            result = response.result()
+            result['server'] = {
+                'ip': self.server.ip,
+                'port': self.server.port,
+                'ping': response.ping
+            }
+            return result
+        return wrapper
 
     def ping(self):
+        """Fake ping request. Send three InfoRequets and calculate an average ping."""
+        self.logger.info('Sending fake ping request')
         MAX_LOOPS = 3
-        return round(sum(map(lambda ping: self.info()['ping'],
+        return round(sum(map(lambda ping: self.info().get('server').get('ping'),
                              range(MAX_LOOPS))) / MAX_LOOPS, 2)
 
-
+    @request
     def info(self):
-        timer_start = time.time()
-        packet = self._query(PacketFactory.create(PacketType.Info))
-        timer_end = time.time()
+        """Request basic server information."""
+        self.logger.info('Sending info request')
+        return self._send(InfoRequest())
 
-        if packet.get_byte() == ResponseType.Info:
-            result = {
-                'protocol_version': packet.get_byte(),
-                'server_name': packet.get_string(),
-                'game_map': packet.get_string(),
-                'game_directory': packet.get_string(),
-                'game_description': packet.get_string(),
-                'game_app_id': packet.get_short(),
-                'players_current':  packet.get_byte(),
-                'players_max': packet.get_byte(),
-                'players_bot': packet.get_byte(),
-                'server_type': chr(packet.get_byte()),
-                'server_os': chr(packet.get_byte()),
-                'password': packet.get_byte(),
-                'secure': packet.get_byte(),
-                'game_version': packet.get_string()
-            }
-
-            try:
-                result['extra_data_flag'] = packet.get_byte()
-            except:
-                pass
-            else:
-                if result['extra_data_flag'] & 0x80:
-                    result['server_port'] = packet.get_short()
-                if result['extra_data_flag'] & 0x10:
-                    result['server_steam_id'] = packet.get_long_long()
-                if result['extra_data_flag'] & 0x40:
-                    result['server_spectator_port'] = packet.get_short()
-                    result['server_spectator_name'] = packet.get_string()
-                if result['extra_data_flag'] & 0x20:
-                    result['server_tags'] = packet.get_string()
-                if result['extra_data_flag'] & 0x01:
-                    result['server_game_id'] = packet.get_long_long()
-            finally:
-                result['server_ip'] =  self.server.ip
-                result['ping'] = round((timer_end - timer_start) * 1000, 2)
-                result['players_human'] = result['players_current'] \
-                                          - result['players_bot']
-                return result
-
+    @request
     def players(self):
-        packet = self._query(PacketFactory.create(PacketType.Players), True)
+        """Request player information."""
+        self.logger.info('Sending players request')
+        return self._send(PlayersRequest())
 
-        if packet.get_byte() == ResponseType.Players:
-            total_players = packet.get_byte()
-            player_list = []
-
-            for i in range(total_players):
-                player = {
-                    'index': packet.get_byte(),
-                    'name': packet.get_string(),
-                    'kills': packet.get_long(),
-                    'playtime': packet.get_float()
-                }
-                player_list.append(player)
-
-            return player_list
-
+    @request
     def rules(self):
-        packet = self._query(PacketFactory.create(PacketType.Rules), True)
+        """Request server rules."""
+        self.logger.info('Sending rules request')
+        return self._send(RulesRequest())
 
-        if packet.get_byte() == ResponseType.Rules:
-            rules = {}
-            total_rules = packet.get_short()
-
-            for i in range(total_rules):
-                rules.setdefault(packet.get_string(), packet.get_string())
-
-            return rules
